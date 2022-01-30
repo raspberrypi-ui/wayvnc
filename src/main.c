@@ -42,7 +42,7 @@
 #include "wlr-output-management-unstable-v1.h"
 #include "linux-dmabuf-unstable-v1.h"
 #include "ext-transient-seat-v1.h"
-#include "screencopy.h"
+#include "screencopy-interface.h"
 #include "data-control.h"
 #include "strlcpy.h"
 #include "output.h"
@@ -56,6 +56,7 @@
 #include "ctl-server.h"
 #include "util.h"
 #include "option-parser.h"
+#include "buffer.h"
 
 #ifdef ENABLE_PAM
 #include "pam_auth.h"
@@ -100,7 +101,7 @@ struct wayvnc {
 	struct output* selected_output;
 	struct seat* selected_seat;
 
-	struct screencopy screencopy;
+	struct screencopy* screencopy;
 
 	struct aml_handler* wayland_handler;
 	struct aml_signal* signal_handler;
@@ -126,6 +127,7 @@ struct wayvnc {
 	bool is_initializing;
 
 	bool start_detached;
+	bool overlay_cursor;
 
 	struct wayvnc_client* master_layout_client;
 };
@@ -144,7 +146,8 @@ struct wayvnc_client {
 };
 
 void wayvnc_exit(struct wayvnc* self);
-void on_capture_done(struct screencopy* sc);
+void on_capture_done(enum screencopy_result result, struct wv_buffer* buffer,
+		void* userdata);
 static void on_nvnc_client_new(struct nvnc_client* client);
 void switch_to_output(struct wayvnc*, struct output*);
 void switch_to_next_output(struct wayvnc*);
@@ -164,6 +167,9 @@ struct zwp_linux_dmabuf_v1* zwp_linux_dmabuf = NULL;
 struct gbm_device* gbm_device = NULL;
 struct zxdg_output_manager_v1* xdg_output_manager = NULL;
 struct zwlr_output_power_manager_v1* wlr_output_power_manager = NULL;
+struct zwlr_screencopy_manager_v1* screencopy_manager = NULL;
+
+extern struct screencopy_impl wlr_screencopy_impl;
 
 static bool registry_add_input(void* data, struct wl_registry* registry,
 			 uint32_t id, const char* interface,
@@ -275,7 +281,7 @@ static void registry_add(void* data, struct wl_registry* registry,
 	}
 
 	if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
-		self->screencopy.manager =
+		screencopy_manager =
 			wl_registry_bind(registry, id,
 					 &zwlr_screencopy_manager_v1_interface,
 					 MIN(3, version));
@@ -417,7 +423,8 @@ static void wayland_detach(struct wayvnc* self)
 	}
 
 	self->selected_output = NULL;
-	self->screencopy.wl_output = NULL;
+	//TODO: Make output inert:
+	//self->screencopy->wl_output = NULL;
 
 	output_list_destroy(&self->outputs);
 	seat_list_destroy(&self->seats);
@@ -426,12 +433,12 @@ static void wayland_detach(struct wayvnc* self)
 		zwp_linux_dmabuf_v1_destroy(zwp_linux_dmabuf);
 	zwp_linux_dmabuf = NULL;
 
-	if (self->screencopy.manager) {
-		screencopy_stop(&self->screencopy);
-		screencopy_destroy(&self->screencopy);
-		zwlr_screencopy_manager_v1_destroy(self->screencopy.manager);
+	if (screencopy_manager) {
+		screencopy_stop(self->screencopy);
+		screencopy_destroy(self->screencopy);
+		zwlr_screencopy_manager_v1_destroy(screencopy_manager);
 	}
-	self->screencopy.manager = NULL;
+	screencopy_manager = NULL;
 
 	if (xdg_output_manager)
 		zxdg_output_manager_v1_destroy(xdg_output_manager);
@@ -457,6 +464,9 @@ static void wayland_detach(struct wayvnc* self)
 	if (self->data_control_manager)
 		zwlr_data_control_manager_v1_destroy(self->data_control_manager);
 	self->data_control_manager = NULL;
+
+	if (screencopy_manager)
+		zwlr_screencopy_manager_v1_destroy(screencopy_manager);
 
 	if (self->performance_ticker) {
 		aml_stop(aml_get_default(), self->performance_ticker);
@@ -559,7 +569,7 @@ static int init_wayland(struct wayvnc* self, const char* display)
 		goto failure;
 	}
 
-	if (!self->screencopy.manager) {
+	if (!screencopy_manager) {
 		nvnc_log(NVNC_LOG_ERROR, "Screencopy protocol not supported by compositor. Exiting. Refer to FAQ section in man page.");
 		goto failure;
 	}
@@ -569,8 +579,8 @@ static int init_wayland(struct wayvnc* self, const char* display)
 		goto failure;
 	}
 
-	self->screencopy.on_done = on_capture_done;
-	self->screencopy.userdata = self;
+	self->screencopy->on_done = on_capture_done;
+	self->screencopy->userdata = self;
 
 	self->wl_handler = aml_handler_new(wl_display_get_fd(self->display),
 	                             on_wayland_event, self, NULL);
@@ -976,7 +986,7 @@ failure:
 
 int wayvnc_start_capture(struct wayvnc* self)
 {
-	int rc = screencopy_start(&self->screencopy);
+	int rc = screencopy_start(self->screencopy, false);
 	if (rc < 0) {
 		nvnc_log(NVNC_LOG_ERROR, "Failed to start capture. Exiting...");
 		wayvnc_exit(self);
@@ -997,7 +1007,7 @@ int wayvnc_start_capture_immediate(struct wayvnc* self)
 		return 0;
 	}
 
-	int rc = screencopy_start_immediate(&self->screencopy);
+	int rc = screencopy_start(self->screencopy, true);
 	if (rc < 0) {
 		nvnc_log(NVNC_LOG_ERROR, "Failed to start capture. Exiting...");
 		wayvnc_exit(self);
@@ -1035,7 +1045,7 @@ void on_output_dimension_change(struct output* output)
 
 	nvnc_log(NVNC_LOG_DEBUG, "Output dimensions changed. Restarting frame capturer...");
 
-	screencopy_stop(&self->screencopy);
+	screencopy_stop(self->screencopy);
 	wayvnc_start_capture_immediate(self);
 }
 
@@ -1054,7 +1064,7 @@ static void on_output_power_change(struct output* output)
 		break;
 	case OUTPUT_POWER_OFF:
 		nvnc_log(NVNC_LOG_WARNING, "Output is now off. Pausing frame capture");
-		screencopy_stop(&self->screencopy);
+		screencopy_stop(self->screencopy);
 		blank_screen(self);
 		break;
 	default:
@@ -1079,10 +1089,9 @@ static uint32_t calculate_region_area(struct pixman_region16* region)
 	return area;
 }
 
-void wayvnc_process_frame(struct wayvnc* self)
+void wayvnc_process_frame(struct wayvnc* self, struct wv_buffer* buffer)
 {
-	struct wv_buffer* buffer = self->screencopy.back;
-	self->screencopy.back = NULL;
+	// TODO: Back buffer used to be set to NULL here, what's that about?
 
 	self->n_frames_captured++;
 	self->damage_area_sum +=
@@ -1120,15 +1129,12 @@ void wayvnc_process_frame(struct wayvnc* self)
 	wayvnc_start_capture(self);
 }
 
-void on_capture_done(struct screencopy* sc)
+void on_capture_done(enum screencopy_result result, struct wv_buffer* buffer,
+		void* userdata)
 {
-	struct wayvnc* self = sc->userdata;
+	struct wayvnc* self = userdata;
 
-	switch (sc->status) {
-	case SCREENCOPY_STOPPED:
-		break;
-	case SCREENCOPY_IN_PROGRESS:
-		break;
+	switch (result) {
 	case SCREENCOPY_FATAL:
 		nvnc_log(NVNC_LOG_ERROR, "Fatal error while capturing. Exiting...");
 		wayvnc_exit(self);
@@ -1137,7 +1143,7 @@ void on_capture_done(struct screencopy* sc)
 		wayvnc_restart_capture(self);
 		break;
 	case SCREENCOPY_DONE:
-		wayvnc_process_frame(self);
+		wayvnc_process_frame(self, buffer);
 		break;
 	}
 }
@@ -1300,7 +1306,7 @@ static void client_destroy(void* obj)
 
 	if (wayvnc->nr_clients == 0 && wayvnc->display) {
 		nvnc_log(NVNC_LOG_INFO, "Stopping screen capture");
-		screencopy_stop(&wayvnc->screencopy);
+		screencopy_stop(wayvnc->screencopy);
 		stop_performance_ticker(wayvnc);
 	}
 
@@ -1524,7 +1530,8 @@ void set_selected_output(struct wayvnc* self, struct output* output) {
 		self->selected_output->on_dimension_change = NULL;
 	}
 	self->selected_output = output;
-	self->screencopy.wl_output = output->wl_output;
+	// TODO: Change screencopy output:
+	// self->screencopy.wl_output = output->wl_output;
 	output->on_dimension_change = on_output_dimension_change;
 	output->on_power_change = on_output_power_change;
 	output->userdata = self;
@@ -1540,7 +1547,7 @@ void switch_to_output(struct wayvnc* self, struct output* output)
 				output->name);
 		return;
 	}
-	screencopy_stop(&self->screencopy);
+	screencopy_stop(self->screencopy);
 	set_selected_output(self, output);
 	reinitialise_pointers(self);
 	if (self->nr_clients > 0)
@@ -1632,12 +1639,13 @@ static bool wayland_attach(struct wayvnc* self, const char* display,
 		}
 	}
 
-	screencopy_init(&self->screencopy);
-	if (!self->screencopy.manager) {
+	if (!screencopy_manager) {
 		nvnc_log(NVNC_LOG_ERROR, "Attached display does not implement wlr-screencopy-v1");
 		wayland_detach(self);
 		return false;
 	}
+	self->screencopy = screencopy_create(&wlr_screencopy_impl,
+			self->selected_output->wl_output, self->overlay_cursor);
 
 	set_selected_output(self, out);
 
@@ -1801,6 +1809,7 @@ int main(int argc, char* argv[])
 	start_detached = !!option_parser_get_value(&option_parser, "detached");
 
 	self.start_detached = start_detached;
+	self.overlay_cursor = overlay_cursor;
 
 	keyboard_options = option_parser_get_value(&option_parser, "keyboard");
 	if (keyboard_options)
@@ -1905,9 +1914,6 @@ int main(int argc, char* argv[])
 		self.selected_seat = seat;
 	}
 
-	self.screencopy.rate_limit = max_rate;
-	self.screencopy.enable_linux_dmabuf = enable_gpu_features;
-
 #ifdef ENABLE_SCREENCOPY_DMABUF
 	if (enable_gpu_features && init_render_node(&drm_fd) < 0) {
 		nvnc_log(NVNC_LOG_ERROR, "Failed to initialise DRM render node. No GPU acceleration will be available.");
@@ -1927,16 +1933,23 @@ int main(int argc, char* argv[])
 		goto nvnc_failure;
 
 	if (!start_detached) {
-		if (self.screencopy.manager)
-			screencopy_init(&self.screencopy);
+		if (screencopy_manager) {
+			self.screencopy = screencopy_create(&wlr_screencopy_impl,
+					self.selected_output->wl_output,
+					overlay_cursor);
+			if (!self.screencopy)
+				goto screencopy_failure;
 
-		if (!self.screencopy.manager) {
+			self.screencopy->rate_limit = max_rate;
+			self.screencopy->enable_linux_dmabuf = enable_gpu_features;
+		} else {
 			nvnc_log(NVNC_LOG_ERROR, "screencopy is not supported by compositor");
 			goto capture_failure;
 		}
 	}
 
-	self.screencopy.overlay_cursor = overlay_cursor;
+	self.screencopy->on_done = on_capture_done;
+	self.screencopy->userdata = &self;
 
 	if (show_performance)
 		self.performance_ticker = aml_ticker_new(1000000, on_perf_tick,
@@ -1972,7 +1985,7 @@ int main(int argc, char* argv[])
 	nvnc_log(NVNC_LOG_INFO, "Exiting...");
 
 	if (self.display)
-		screencopy_stop(&self.screencopy);
+		screencopy_stop(self.screencopy);
 
 	ctl_server_destroy(self.ctl);
 	self.ctl = NULL;
@@ -1981,6 +1994,10 @@ int main(int argc, char* argv[])
 	nvnc_close(self.nvnc);
 	self.nvnc = NULL;
 	wayvnc_destroy(&self);
+	if (zwp_linux_dmabuf)
+		zwp_linux_dmabuf_v1_destroy(zwp_linux_dmabuf);
+	if (self.screencopy)
+		screencopy_destroy(self.screencopy);
 #ifdef ENABLE_SCREENCOPY_DMABUF
 	if (gbm_device) {
 		gbm_device_destroy(gbm_device);
@@ -1993,6 +2010,7 @@ int main(int argc, char* argv[])
 
 ctl_server_failure:
 capture_failure:
+screencopy_failure:
 	nvnc_display_unref(self.nvnc_display);
 	nvnc_close(self.nvnc);
 nvnc_failure:
