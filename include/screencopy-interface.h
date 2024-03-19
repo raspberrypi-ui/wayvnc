@@ -55,8 +55,8 @@ struct screencopy {
 	void* userdata;
 };
 
-struct screencopy* screencopy_create(struct screencopy_impl* impl,
-		struct wl_output* output, bool render_cursor);
+struct screencopy* screencopy_create(struct wl_output* output,
+		bool render_cursor);
 struct screencopy* screencopy_create_cursor(struct screencopy_impl* impl,
 		struct wl_output* output);
 void screencopy_destroy(struct screencopy* self);

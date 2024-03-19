@@ -35,6 +35,8 @@
 #include <fcntl.h>
 
 #include "wlr-screencopy-unstable-v1.h"
+#include "ext-screencopy-v1.h"
+#include "ext-image-source-v1.h"
 #include "wlr-virtual-pointer-unstable-v1.h"
 #include "virtual-keyboard-unstable-v1.h"
 #include "xdg-output-unstable-v1.h"
@@ -128,6 +130,8 @@ struct wayvnc {
 
 	bool start_detached;
 	bool overlay_cursor;
+	int max_rate;
+	bool enable_gpu_features;
 
 	struct wayvnc_client* master_layout_client;
 };
@@ -168,8 +172,10 @@ struct gbm_device* gbm_device = NULL;
 struct zxdg_output_manager_v1* xdg_output_manager = NULL;
 struct zwlr_output_power_manager_v1* wlr_output_power_manager = NULL;
 struct zwlr_screencopy_manager_v1* screencopy_manager = NULL;
+struct ext_image_source_manager_v1* ext_image_source_manager = NULL;
+struct ext_screencopy_manager_v1* ext_screencopy_manager = NULL;
 
-extern struct screencopy_impl wlr_screencopy_impl;
+extern struct screencopy_impl wlr_screencopy_impl, ext_screencopy_impl;
 
 static bool registry_add_input(void* data, struct wl_registry* registry,
 			 uint32_t id, const char* interface,
@@ -287,6 +293,23 @@ static void registry_add(void* data, struct wl_registry* registry,
 					 MIN(3, version));
 		return;
 	}
+
+#if 1
+	if (strcmp(interface, ext_screencopy_manager_v1_interface.name) == 0) {
+		ext_screencopy_manager =
+			wl_registry_bind(registry, id,
+					 &ext_screencopy_manager_v1_interface,
+					 MIN(1, version));
+		return;
+	}
+
+	if (strcmp(interface, ext_image_source_manager_v1_interface.name) == 0) {
+		ext_image_source_manager = wl_registry_bind(registry, id,
+					 &ext_image_source_manager_v1_interface,
+					 MIN(1, version));
+		return;
+	}
+#endif
 
 	if (strcmp(interface, wl_shm_interface.name) == 0) {
 		wl_shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
@@ -423,8 +446,6 @@ static void wayland_detach(struct wayvnc* self)
 	}
 
 	self->selected_output = NULL;
-	//TODO: Make output inert:
-	//self->screencopy->wl_output = NULL;
 
 	output_list_destroy(&self->outputs);
 	seat_list_destroy(&self->seats);
@@ -465,14 +486,23 @@ static void wayland_detach(struct wayvnc* self)
 		zwlr_data_control_manager_v1_destroy(self->data_control_manager);
 	self->data_control_manager = NULL;
 
-	if (screencopy_manager)
-		zwlr_screencopy_manager_v1_destroy(screencopy_manager);
-
 	if (self->performance_ticker) {
 		aml_stop(aml_get_default(), self->performance_ticker);
 		aml_unref(self->performance_ticker);
 	}
 	self->performance_ticker = NULL;
+
+	if (screencopy_manager)
+		zwlr_screencopy_manager_v1_destroy(screencopy_manager);
+	screencopy_manager = NULL;
+
+	if (ext_image_source_manager)
+		ext_image_source_manager_v1_destroy(ext_image_source_manager);
+	ext_image_source_manager = NULL;
+
+	if (ext_screencopy_manager)
+		ext_screencopy_manager_v1_destroy(ext_screencopy_manager);
+	ext_screencopy_manager = NULL;
 
 	if (self->capture_retry_timer)
 		aml_unref(self->capture_retry_timer);
@@ -569,7 +599,7 @@ static int init_wayland(struct wayvnc* self, const char* display)
 		goto failure;
 	}
 
-	if (!screencopy_manager) {
+	if (!screencopy_manager && !ext_screencopy_manager) {
 		nvnc_log(NVNC_LOG_ERROR, "Screencopy protocol not supported by compositor. Exiting. Refer to FAQ section in man page.");
 		goto failure;
 	}
@@ -1093,6 +1123,8 @@ void wayvnc_process_frame(struct wayvnc* self, struct wv_buffer* buffer)
 {
 	// TODO: Back buffer used to be set to NULL here, what's that about?
 
+	nvnc_log(NVNC_LOG_DEBUG, "Passing on buffer: %p", buffer);
+
 	self->n_frames_captured++;
 	self->damage_area_sum +=
 		calculate_region_area(&buffer->frame_damage);
@@ -1525,16 +1557,32 @@ void log_selected_output(struct wayvnc* self)
 	}
 }
 
-void set_selected_output(struct wayvnc* self, struct output* output) {
+bool configure_screencopy(struct wayvnc* self)
+{
+	screencopy_destroy(self->screencopy);
+	self->screencopy = screencopy_create(self->selected_output->wl_output,
+			self->overlay_cursor);
+	if (!self->screencopy) {
+		nvnc_log(NVNC_LOG_ERROR, "screencopy is not supported by compositor");
+		return false;
+	}
+
+	self->screencopy->rate_limit = self->max_rate;
+	self->screencopy->enable_linux_dmabuf = self->enable_gpu_features;
+
+	return true;
+}
+
+void set_selected_output(struct wayvnc* self, struct output* output)
+{
 	if (self->selected_output) {
 		self->selected_output->on_dimension_change = NULL;
 	}
 	self->selected_output = output;
-	// TODO: Change screencopy output:
-	// self->screencopy.wl_output = output->wl_output;
 	output->on_dimension_change = on_output_dimension_change;
 	output->on_power_change = on_output_power_change;
 	output->userdata = self;
+
 	if (self->ctl)
 		ctl_server_event_capture_changed(self->ctl, output->name);
 	log_selected_output(self);
@@ -1549,6 +1597,7 @@ void switch_to_output(struct wayvnc* self, struct output* output)
 	}
 	screencopy_stop(self->screencopy);
 	set_selected_output(self, output);
+	configure_screencopy(self);
 	reinitialise_pointers(self);
 	if (self->nr_clients > 0)
 		wayvnc_start_capture_immediate(self);
@@ -1644,10 +1693,8 @@ static bool wayland_attach(struct wayvnc* self, const char* display,
 		wayland_detach(self);
 		return false;
 	}
-	self->screencopy = screencopy_create(&wlr_screencopy_impl,
-			self->selected_output->wl_output, self->overlay_cursor);
-
 	set_selected_output(self, out);
+	configure_screencopy(self);
 
 	struct nvnc_client* nvnc_client;
 	for (nvnc_client = nvnc_client_first(self->nvnc); nvnc_client;
@@ -1810,6 +1857,8 @@ int main(int argc, char* argv[])
 
 	self.start_detached = start_detached;
 	self.overlay_cursor = overlay_cursor;
+	self.max_rate = max_rate;
+	self.enable_gpu_features = enable_gpu_features;
 
 	keyboard_options = option_parser_get_value(&option_parser, "keyboard");
 	if (keyboard_options)
@@ -1932,21 +1981,8 @@ int main(int argc, char* argv[])
 	if (init_nvnc(&self, address, port, socket_type) < 0)
 		goto nvnc_failure;
 
-	if (!start_detached) {
-		if (screencopy_manager) {
-			self.screencopy = screencopy_create(&wlr_screencopy_impl,
-					self.selected_output->wl_output,
-					overlay_cursor);
-			if (!self.screencopy)
-				goto screencopy_failure;
-
-			self.screencopy->rate_limit = max_rate;
-			self.screencopy->enable_linux_dmabuf = enable_gpu_features;
-		} else {
-			nvnc_log(NVNC_LOG_ERROR, "screencopy is not supported by compositor");
-			goto capture_failure;
-		}
-	}
+	if (!start_detached && !configure_screencopy(&self))
+		goto screencopy_failure;
 
 	self.screencopy->on_done = on_capture_done;
 	self.screencopy->userdata = &self;
@@ -2009,7 +2045,6 @@ int main(int argc, char* argv[])
 	return 0;
 
 ctl_server_failure:
-capture_failure:
 screencopy_failure:
 	nvnc_display_unref(self.nvnc_display);
 	nvnc_close(self.nvnc);

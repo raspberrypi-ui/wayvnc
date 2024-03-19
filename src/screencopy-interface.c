@@ -18,10 +18,21 @@
 
 #include <unistd.h>
 
-struct screencopy* screencopy_create(struct screencopy_impl* impl,
-		struct wl_output* output, bool render_cursor)
+extern struct zwlr_screencopy_manager_v1* screencopy_manager;
+extern struct ext_image_source_manager_v1* ext_image_source_manager;
+extern struct ext_screencopy_manager_v1* ext_screencopy_manager;
+
+extern struct screencopy_impl wlr_screencopy_impl;
+extern struct screencopy_impl ext_screencopy_impl;
+
+struct screencopy* screencopy_create(struct wl_output* output,
+		bool render_cursor)
 {
-	return impl->create(output, render_cursor);
+	if (ext_screencopy_manager && ext_image_source_manager)
+		return ext_screencopy_impl.create(output, render_cursor);
+	if (screencopy_manager)
+		return wlr_screencopy_impl.create(output, render_cursor);
+	return NULL;
 }
 
 struct screencopy* screencopy_create_cursor(struct screencopy_impl* impl,
@@ -32,7 +43,8 @@ struct screencopy* screencopy_create_cursor(struct screencopy_impl* impl,
 
 void screencopy_destroy(struct screencopy* self)
 {
-	self->impl->destroy(self);
+	if (self)
+		self->impl->destroy(self);
 }
 
 int screencopy_start(struct screencopy* self, bool immediate)
