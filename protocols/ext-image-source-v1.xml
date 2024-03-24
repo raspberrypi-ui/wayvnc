@@ -2,6 +2,7 @@
 <protocol name="ext_image_source_v1">
   <copyright>
     Copyright © 2022 Andri Yngvason
+    Copyright © 2024 Simon Ser
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the "Software"),
@@ -30,18 +31,41 @@
     This protocol may be extended to support more image sources in the future,
     thereby adding those image sources to other protocols that use the image
     source object without having to modify those protocols.
+
+    Warning! The protocol described in this file is currently in the testing
+    phase. Backward compatible changes may be added together with the
+    corresponding interface version bump. Backward incompatible changes can
+    only be done by creating a new major version of the extension.
   </description>
 
-  <interface name="ext_image_source_manager_v1" version="1">
-    <description summary="opaque image source manager">
-      A manager for creating image source objects for standard objects. Sources
-      may also be created from elsewhere.
+  <interface name="ext_image_source_v1" version="1">
+    <description summary="opaque image source object">
+      The image source object is an opaque descriptor for a capturable resource.
+      This resource may be any sort of entity from which an image may be
+      derived.
+
+      Note, because ext_image_source_v1 objects are created from multiple
+      independent factory interfaces, the ext_image_source_v1 interface is
+      frozen at version 1.
     </description>
 
-    <request name="create_output_source">
+    <request name="destroy" type="destructor">
+      <description summary="delete this object">
+        Destroys the image source. This request may be sent at any time by the
+        client.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="ext_output_image_source_manager_v1" version="1">
+    <description summary="image source manager for outputs">
+      A manager for creating image source objects for wl_output objects.
+    </description>
+
+    <request name="create_source">
       <description summary="create source object for output">
         Creates a source object for an output. Images captured from this source
-        will show the same image as the output. Some elements may be omitted,
+        will show the same content as the output. Some elements may be omitted,
         such as cursors and overlays that have been marked as transparent to
         capturing.
       </description>
@@ -54,23 +78,6 @@
         Destroys the manager. This request may be sent at any time by the client
         and objects created by the manager will remain valid after its
         destruction.
-      </description>
-    </request>
-  </interface>
-
-  <interface name="ext_image_source_v1" version="1">
-    <description summary="opaque image source object">
-      The image source object is an opaque descriptor for a capturable resource.
-      This resource may be any sort of entity from which an image may be
-      derived.
-
-      This interface may not be extended.
-    </description>
-
-    <request name="destroy" type="destructor">
-      <description summary="delete this object">
-        Destroys the image source. This request may be sent at any time by the
-        client.
       </description>
     </request>
   </interface>

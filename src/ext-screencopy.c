@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 - 2023 Andri Yngvason
+ * Copyright (c) 2022 - 2024 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -36,13 +36,14 @@
 #include "config.h"
 #include "logging.h"
 
-extern struct ext_image_source_manager_v1* ext_image_source_manager;
+extern struct ext_output_image_source_manager_v1* ext_output_image_source_manager;
 extern struct ext_screencopy_manager_v1* ext_screencopy_manager;
 
 struct ext_screencopy {
 	struct screencopy parent;
 	struct wl_output* wl_output;
 	struct ext_screencopy_session_v1* session;
+	struct ext_screencopy_frame_v1* frame;
 	struct ext_screencopy_cursor_session_v1* cursor;
 	bool render_cursors;
 	struct wv_buffer_pool* pool;
@@ -63,40 +64,32 @@ struct ext_screencopy {
 struct screencopy_impl ext_screencopy_impl;
 
 static struct ext_screencopy_session_v1_listener session_listener;
-static struct ext_screencopy_cursor_session_v1_listener cursor_listener;
+static struct ext_screencopy_frame_v1_listener frame_listener;
+//static struct ext_screencopy_cursor_session_v1_listener cursor_listener;
 
 static int ext_screencopy_init_session(struct ext_screencopy* self)
 {
+	if (self->frame)
+		ext_screencopy_frame_v1_destroy(self->frame);
+	self->frame = NULL;
+
 	if (self->session)
 		ext_screencopy_session_v1_destroy(self->session);
+	self->session = NULL;
 
 	struct ext_image_source_v1* source;
-	source = ext_image_source_manager_v1_create_output_source(
-			ext_image_source_manager, self->wl_output);
+	source = ext_output_image_source_manager_v1_create_source(
+			ext_output_image_source_manager, self->wl_output);
 	if (!source)
 		return -1;
 
 	enum ext_screencopy_manager_v1_options options = 0;
 	if (self->render_cursors)
-		options |= EXT_SCREENCOPY_MANAGER_V1_OPTIONS_RENDER_CURSORS;
+		options |= EXT_SCREENCOPY_MANAGER_V1_OPTIONS_PAINT_CURSORS;
 
-	if (self->capture_cursor) {
-		self->cursor = ext_screencopy_manager_v1_capture_cursor(
-				ext_screencopy_manager, source, NULL,
-				EXT_SCREENCOPY_MANAGER_V1_INPUT_TYPE_POINTER,
-				options);
-		ext_image_source_v1_destroy(source);
-		if (!self->cursor)
-			return -1;
-
-		self->session =
-			ext_screencopy_cursor_session_v1_get_screencopy_session(
-				self->cursor);
-	} else {
-		self->session = ext_screencopy_manager_v1_capture(
-				ext_screencopy_manager, source, options);
-		ext_image_source_v1_destroy(source);
-	}
+	self->session = ext_screencopy_manager_v1_create_session(
+			ext_screencopy_manager, source, options);
+	ext_image_source_v1_destroy(source);
 	if (!self->session)
 		return -1;
 
@@ -104,8 +97,7 @@ static int ext_screencopy_init_session(struct ext_screencopy* self)
 			&session_listener, self);
 
 	if (self->capture_cursor) {
-		ext_screencopy_cursor_session_v1_add_listener(self->cursor,
-				&cursor_listener, self);
+		// TODO: create_pointer_cursor_session
 	}
 
 	return 0;
@@ -115,12 +107,21 @@ static int ext_screencopy_init_session(struct ext_screencopy* self)
 static void ext_screencopy_schedule_capture(struct ext_screencopy* self,
 		bool immediate)
 {
+	assert(!self->frame);
+
+	// TODO: Restart session on immediate capture
+
 	self->buffer = wv_buffer_pool_acquire(self->pool);
 	self->buffer->domain = self->capture_cursor ? WV_BUFFER_DOMAIN_CURSOR :
 		WV_BUFFER_DOMAIN_OUTPUT;
 
-	ext_screencopy_session_v1_attach_buffer(self->session,
+	self->frame = ext_screencopy_session_v1_create_frame(self->session);
+	assert(self->frame);
+
+	ext_screencopy_frame_v1_attach_buffer(self->frame,
 			self->buffer->wl_buffer);
+	ext_screencopy_frame_v1_add_listener(self->frame, &frame_listener,
+			self);
 
 	int n_rects = 0;
 	struct pixman_box16* rects =
@@ -132,16 +133,11 @@ static void ext_screencopy_schedule_capture(struct ext_screencopy* self,
 		uint32_t width = rects[i].x2 - x;
 		uint32_t height = rects[i].y2 - y;
 
-		ext_screencopy_session_v1_damage_buffer(self->session, x, y,
+		ext_screencopy_frame_v1_damage_buffer(self->frame, x, y,
 				width, height);
 	}
 
-	uint32_t flags = 0;
-
-	if (!immediate)
-		flags |= EXT_SCREENCOPY_SESSION_V1_OPTIONS_ON_DAMAGE;
-
-	ext_screencopy_session_v1_commit(self->session, flags);
+	ext_screencopy_frame_v1_capture(self->frame);
 
 	nvnc_log(NVNC_LOG_DEBUG, "Committed buffer%s: %p\n", immediate ? " immediately" : "",
 			self->buffer);
@@ -159,14 +155,22 @@ static void session_handle_format_shm(void *data,
 
 static void session_handle_format_drm(void *data,
 		struct ext_screencopy_session_v1 *session,
-		uint32_t format)
+		uint32_t format, struct wl_array* modifiers)
 {
 	struct ext_screencopy* self = data;
 
 #ifdef ENABLE_SCREENCOPY_DMABUF
 	self->have_linux_dmabuf = true;
 	self->dmabuf_format = format;
+	// TODO: Pass modifiers
 #endif
+}
+
+static void session_handle_dmabuf_device(void* data,
+		struct ext_screencopy_session_v1* session,
+		struct wl_array *device)
+{
+	// TODO
 }
 
 static void session_handle_dimensions(void *data,
@@ -217,9 +221,14 @@ static void session_handle_constraints_done(void *data,
 	nvnc_log(NVNC_LOG_DEBUG, "Init done\n");
 }
 
-static void session_handle_transform(void *data,
-		struct ext_screencopy_session_v1 *session,
-		int32_t transform)
+static void session_handle_stopped(void* data,
+		struct ext_screencopy_session_v1* session)
+{
+	// TODO
+}
+
+static void frame_handle_transform(void *data,
+		struct ext_screencopy_frame_v1 *frame, uint32_t transform)
 {
 	struct ext_screencopy* self = data;
 
@@ -229,10 +238,14 @@ static void session_handle_transform(void *data,
 	nvnc_fb_set_transform(self->buffer->nvnc_fb, transform);
 }
 
-static void session_handle_ready(void *data,
-		struct ext_screencopy_session_v1 *session)
+static void frame_handle_ready(void *data,
+		struct ext_screencopy_frame_v1 *frame)
 {
 	struct ext_screencopy* self = data;
+
+	assert(frame == self->frame);
+	ext_screencopy_frame_v1_destroy(self->frame);
+	self->frame = NULL;
 
 	nvnc_log(NVNC_LOG_DEBUG, "Ready!\n");
 
@@ -249,11 +262,15 @@ static void session_handle_ready(void *data,
 	self->parent.on_done(SCREENCOPY_DONE, buffer, self->parent.userdata);
 }
 
-static void session_handle_failed(void *data,
-		struct ext_screencopy_session_v1 *session,
-		enum ext_screencopy_session_v1_failure_reason reason)
+static void frame_handle_failed(void *data,
+		struct ext_screencopy_frame_v1 *frame,
+		enum ext_screencopy_frame_v1_failure_reason reason)
 {
 	struct ext_screencopy* self = data;
+
+	assert(frame == self->frame);
+	ext_screencopy_frame_v1_destroy(self->frame);
+	self->frame = NULL;
 
 	nvnc_log(NVNC_LOG_DEBUG, "Failed!\n");
 
@@ -262,39 +279,44 @@ static void session_handle_failed(void *data,
 	wv_buffer_pool_release(self->pool, self->buffer);
 	self->buffer = NULL;
 
-	if (reason == EXT_SCREENCOPY_SESSION_V1_FAILURE_REASON_INVALID_BUFFER) {
+	if (reason == EXT_SCREENCOPY_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS) {
 		ext_screencopy_init_session(self);
 	}
 
 	self->parent.on_done(SCREENCOPY_FAILED, NULL, self->parent.userdata);
 }
 
-static void session_handle_damage(void *data,
-		struct ext_screencopy_session_v1 *session,
-		uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+static void frame_handle_damage(void *data,
+		struct ext_screencopy_frame_v1 *frame,
+		int32_t x, int32_t y, int32_t width, int32_t height)
 {
 	struct ext_screencopy* self = data;
 
 	wv_buffer_damage_rect(self->buffer, x, y, width, height);
 }
 
-static void session_handle_presentation_time(void *data,
-		struct ext_screencopy_session_v1 *session,
+static void frame_handle_presentation_time(void *data,
+		struct ext_screencopy_frame_v1 *frame,
 		uint32_t sec_hi, uint32_t sec_lo, uint32_t nsec)
 {
 	// TODO
 }
 
 static struct ext_screencopy_session_v1_listener session_listener = {
-	.format_shm = session_handle_format_shm,
-	.format_drm = session_handle_format_drm,
-	.dimensions = session_handle_dimensions,
-	.constraints_done = session_handle_constraints_done,
-	.damage = session_handle_damage,
-	.presentation_time = session_handle_presentation_time,
-	.transform = session_handle_transform,
-	.ready = session_handle_ready,
-	.failed = session_handle_failed,
+	.shm_format = session_handle_format_shm,
+	.dmabuf_format = session_handle_format_drm,
+	.dmabuf_device = session_handle_dmabuf_device,
+	.buffer_size = session_handle_dimensions,
+	.done = session_handle_constraints_done,
+	.stopped = session_handle_stopped,
+};
+
+static struct ext_screencopy_frame_v1_listener frame_listener = {
+	.damage = frame_handle_damage,
+	.presentation_time = frame_handle_presentation_time,
+	.transform = frame_handle_transform,
+	.ready = frame_handle_ready,
+	.failed = frame_handle_failed,
 };
 
 static void cursor_handle_enter(void* data,
@@ -327,12 +349,14 @@ static void cursor_handle_hotspot(void* data,
 		self->parent.cursor_hotspot(x, y, self->parent.userdata);
 }
 
+/*
 static struct ext_screencopy_cursor_session_v1_listener cursor_listener = {
 	.enter = cursor_handle_enter,
 	.leave = cursor_handle_leave,
 	.position = cursor_handle_position,
 	.hotspot = cursor_handle_hotspot,
 };
+*/
 
 static int ext_screencopy_start(struct screencopy* ptr, bool immediate)
 {
@@ -414,6 +438,8 @@ void ext_screencopy_destroy(struct screencopy* ptr)
 {
 	struct ext_screencopy* self = (struct ext_screencopy*)ptr;
 
+	if (self->frame)
+		ext_screencopy_frame_v1_destroy(self->frame);
 	if (self->session)
 		ext_screencopy_session_v1_destroy(self->session);
 	if (self->buffer)

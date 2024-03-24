@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 extern struct zwlr_screencopy_manager_v1* screencopy_manager;
-extern struct ext_image_source_manager_v1* ext_image_source_manager;
+extern struct ext_output_image_source_manager_v1* ext_output_image_source_manager;
 extern struct ext_screencopy_manager_v1* ext_screencopy_manager;
 
 extern struct screencopy_impl wlr_screencopy_impl;
@@ -28,7 +28,7 @@ extern struct screencopy_impl ext_screencopy_impl;
 struct screencopy* screencopy_create(struct wl_output* output,
 		bool render_cursor)
 {
-	if (ext_screencopy_manager && ext_image_source_manager)
+	if (ext_screencopy_manager && ext_output_image_source_manager)
 		return ext_screencopy_impl.create(output, render_cursor);
 	if (screencopy_manager)
 		return wlr_screencopy_impl.create(output, render_cursor);

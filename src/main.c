@@ -172,7 +172,7 @@ struct gbm_device* gbm_device = NULL;
 struct zxdg_output_manager_v1* xdg_output_manager = NULL;
 struct zwlr_output_power_manager_v1* wlr_output_power_manager = NULL;
 struct zwlr_screencopy_manager_v1* screencopy_manager = NULL;
-struct ext_image_source_manager_v1* ext_image_source_manager = NULL;
+struct ext_output_image_source_manager_v1* ext_output_image_source_manager = NULL;
 struct ext_screencopy_manager_v1* ext_screencopy_manager = NULL;
 
 extern struct screencopy_impl wlr_screencopy_impl, ext_screencopy_impl;
@@ -303,10 +303,11 @@ static void registry_add(void* data, struct wl_registry* registry,
 		return;
 	}
 
-	if (strcmp(interface, ext_image_source_manager_v1_interface.name) == 0) {
-		ext_image_source_manager = wl_registry_bind(registry, id,
-					 &ext_image_source_manager_v1_interface,
-					 MIN(1, version));
+	if (strcmp(interface, ext_output_image_source_manager_v1_interface.name) == 0) {
+		ext_output_image_source_manager =
+			wl_registry_bind(registry, id,
+					&ext_output_image_source_manager_v1_interface,
+					MIN(1, version));
 		return;
 	}
 #endif
@@ -496,9 +497,9 @@ static void wayland_detach(struct wayvnc* self)
 		zwlr_screencopy_manager_v1_destroy(screencopy_manager);
 	screencopy_manager = NULL;
 
-	if (ext_image_source_manager)
-		ext_image_source_manager_v1_destroy(ext_image_source_manager);
-	ext_image_source_manager = NULL;
+	if (ext_output_image_source_manager)
+		ext_output_image_source_manager_v1_destroy(ext_output_image_source_manager);
+	ext_output_image_source_manager = NULL;
 
 	if (ext_screencopy_manager)
 		ext_screencopy_manager_v1_destroy(ext_screencopy_manager);
@@ -608,9 +609,6 @@ static int init_wayland(struct wayvnc* self, const char* display)
 		nvnc_log(NVNC_LOG_ERROR, "Transient seat protocol not supported by compositor");
 		goto failure;
 	}
-
-	self->screencopy->on_done = on_capture_done;
-	self->screencopy->userdata = self;
 
 	self->wl_handler = aml_handler_new(wl_display_get_fd(self->display),
 	                             on_wayland_event, self, NULL);
@@ -953,7 +951,7 @@ static int init_nvnc(struct wayvnc* self, const char* addr, uint16_t port,
 
 	nvnc_set_name(self->nvnc, "WayVNC");
 
-	nvnc_set_desktop_layout_fn(self->nvnc, on_client_resize);
+	//nvnc_set_desktop_layout_fn(self->nvnc, on_client_resize);
 
 	enum nvnc_auth_flags auth_flags = 0;
 	if (self->cfg.enable_auth) {
@@ -1566,6 +1564,9 @@ bool configure_screencopy(struct wayvnc* self)
 		nvnc_log(NVNC_LOG_ERROR, "screencopy is not supported by compositor");
 		return false;
 	}
+
+	self->screencopy->on_done = on_capture_done;
+	self->screencopy->userdata = self;
 
 	self->screencopy->rate_limit = self->max_rate;
 	self->screencopy->enable_linux_dmabuf = self->enable_gpu_features;
